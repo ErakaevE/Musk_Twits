@@ -34,7 +34,7 @@ ET_ZONE = ZoneInfo("America/New_York")
 X_API_BASE = "https://api.x.com/2"
 
 # Сколько твитов максимум забирать за один прогон (лимит API 5-100)
-MAX_RESULTS = 20
+MAX_RESULTS = 50
 
 
 # ---------- Вспомогательные функции ----------
