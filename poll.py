@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Забирает новые посты указанного X-аккаунта, переводит их на русский
-и публикует в Telegram-группу/канал. Под каждым постом указывает,
-сколько постов было опубликовано за текущие сутки (с 00:00 по времени ET).
+Забирает новые посты указанного X-аккаунта (включая репосты и цитаты
+других пользователей), переводит их на русский и публикует в Telegram-
+группу/канал. Под каждым постом указывает, сколько постов было
+опубликовано за текущие сутки (с 00:00 по времени ET).
 
 Запускается по расписанию (например, каждые 5 минут) через GitHub Actions.
 Состояние (id последнего обработанного твита + счётчик за сутки)
@@ -64,16 +65,22 @@ def get_user_id(username: str) -> str:
     return resp.json()["data"]["id"]
 
 
-def fetch_new_tweets(user_id: str, since_id: str | None) -> list[dict]:
+def fetch_new_tweets(user_id: str, since_id: str | None) -> tuple[list[dict], dict, dict]:
     """
-    Возвращает список новых твитов (от старых к новым), исключая
-    ретвиты и ответы -- то есть только оригинальные посты и цитаты.
+    Возвращает (tweets, tweets_by_id, users_by_id):
+      - tweets: список новых твитов (от старых к новым), включая репосты
+        и цитаты; исключены только ответы (replies).
+      - tweets_by_id: словарь id -> твит для всех "включённых" (referenced)
+        твитов -- то есть оригиналов, которые репостнули/процитировали.
+      - users_by_id: словарь id -> username для авторов этих оригиналов.
     """
     url = f"{X_API_BASE}/users/{user_id}/tweets"
     params = {
         "max_results": MAX_RESULTS,
-        "exclude": "retweets,replies",
-        "tweet.fields": "created_at,text",
+        "exclude": "replies",  # репосты (retweets) больше НЕ исключаем
+        "tweet.fields": "created_at,text,referenced_tweets",
+        "expansions": "referenced_tweets.id,referenced_tweets.id.author_id",
+        "user.fields": "username",
     }
     if since_id:
         params["since_id"] = since_id
@@ -86,13 +93,20 @@ def fetch_new_tweets(user_id: str, since_id: str | None) -> list[dict]:
     )
     resp.raise_for_status()
     data = resp.json()
+
     tweets = data.get("data", [])
-    # API отдаёт от новых к старым — разворачиваем, чтобы постить по порядку
-    tweets.reverse()
-    return tweets
+    tweets.reverse()  # API отдаёт от новых к старым — разворачиваем
+
+    includes = data.get("includes", {})
+    tweets_by_id = {t["id"]: t for t in includes.get("tweets", [])}
+    users_by_id = {u["id"]: u["username"] for u in includes.get("users", [])}
+
+    return tweets, tweets_by_id, users_by_id
 
 
 def translate_to_ru(text: str) -> str:
+    if not text:
+        return text
     try:
         return GoogleTranslator(source="en", target="ru").translate(text)
     except Exception as exc:  # noqa: BLE001
@@ -108,7 +122,10 @@ def send_to_telegram(message: str) -> None:
             "chat_id": TELEGRAM_CHAT_ID,
             "text": message,
             "parse_mode": "HTML",
-            "disable_web_page_preview": "false",
+            # Отключаем автопревью: мы сами вставляем переведённый текст
+            # цитируемого/репостнутого твита, второй (непереведённый)
+            # превью-блок от Telegram не нужен.
+            "disable_web_page_preview": "true",
         },
         timeout=30,
     )
@@ -117,10 +134,52 @@ def send_to_telegram(message: str) -> None:
     resp.raise_for_status()
 
 
-def format_message(username: str, tweet_id: str, ru_text: str, count_today: int) -> str:
-    link = f"https://x.com/{username}/status/{tweet_id}"
+def build_message(
+    tweet: dict,
+    tweets_by_id: dict,
+    users_by_id: dict,
+    count_today: int,
+) -> str:
+    """
+    Формирует текст сообщения для Telegram в зависимости от типа поста:
+    обычный пост, репост (retweet) или цитата (quote).
+    """
+    ref_list = tweet.get("referenced_tweets") or []
+    ref_type = ref_list[0]["type"] if ref_list else None
+    ref_id = ref_list[0]["id"] if ref_list else None
+    ref_tweet = tweets_by_id.get(ref_id) if ref_id else None
+    ref_author = users_by_id.get(ref_tweet.get("author_id")) if ref_tweet else None
+
+    if ref_type == "retweeted" and ref_tweet:
+        # Классический репост: показываем переведённый оригинал автора,
+        # а не собственный текст твита ("RT @user: ...")
+        original_text = ref_tweet.get("text", "")
+        ru_text = translate_to_ru(original_text)
+        header = f"🔁 <b>Репост от @{ref_author or '?'}</b>"
+        body = f"{header}\n\n{ru_text}"
+        link = (
+            f"https://x.com/{ref_author}/status/{ref_id}"
+            if ref_author
+            else f"https://x.com/{X_USERNAME}/status/{tweet['id']}"
+        )
+
+    elif ref_type == "quoted" and ref_tweet:
+        # Цитата: переводим и комментарий Маска, и текст процитированного поста
+        own_ru = translate_to_ru(tweet.get("text", ""))
+        quoted_ru = translate_to_ru(ref_tweet.get("text", ""))
+        body = (
+            f"{own_ru}\n\n"
+            f"💬 <b>Цитата поста @{ref_author or '?'}:</b>\n{quoted_ru}"
+        )
+        link = f"https://x.com/{X_USERNAME}/status/{tweet['id']}"
+
+    else:
+        # Обычный оригинальный пост
+        body = translate_to_ru(tweet.get("text", ""))
+        link = f"https://x.com/{X_USERNAME}/status/{tweet['id']}"
+
     return (
-        f"{ru_text}\n\n"
+        f"{body}\n\n"
         f"🔗 <a href=\"{link}\">оригинал</a>\n"
         f"📊 Постов за сутки (с 00:00 ET): <b>{count_today}</b>"
     )
@@ -142,7 +201,9 @@ def main() -> None:
         state["day"] = current_day
         state["count"] = 0
 
-    tweets = fetch_new_tweets(state["user_id"], state.get("last_id"))
+    tweets, tweets_by_id, users_by_id = fetch_new_tweets(
+        state["user_id"], state.get("last_id")
+    )
 
     if not tweets:
         print("Новых твитов нет.")
@@ -151,10 +212,7 @@ def main() -> None:
 
     for tweet in tweets:
         state["count"] += 1
-        ru_text = translate_to_ru(tweet["text"])
-        message = format_message(
-            X_USERNAME, tweet["id"], ru_text, state["count"]
-        )
+        message = build_message(tweet, tweets_by_id, users_by_id, state["count"])
         send_to_telegram(message)
         state["last_id"] = tweet["id"]
         save_state(state)  # сохраняем после каждого поста, чтобы не потерять прогресс
